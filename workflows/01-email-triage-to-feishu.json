@@ -1,0 +1,137 @@
+{
+  "name": "飞书办公 01 - 企业邮箱 AI 分类与提醒",
+  "nodes": [
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "2480f0f3-3c20-47a6-a198-744352e88db0",
+      "name": "企业邮箱触发器（IMAP）",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [220, 440]
+    },
+    {
+      "parameters": {
+        "jsCode": "const e = $input.first().json;\nconst fromObject = e.from?.value?.[0] || {};\nconst from = fromObject.address || e.from || '';\nconst fromName = fromObject.name || '';\nconst html = e.textHtml || '';\nconst plain = e.textPlain || e.text || html.replace(/<[^>]*>/g, ' ');\nconst redacted = String(plain)\n  .replace(/\\b\\d{6}\\b/g, '[可能的验证码已隐藏]')\n  .replace(/(api[_-]?key|access[_-]?token|token|password|密码)\s*[:=：]\s*\S+/gi, '$1=[已隐藏]')\n  .replace(/\\b(?:\\d[ -]*?){13,19}\\b/g, '[可能的银行卡号已隐藏]')\n  .replace(/\s+/g, ' ')\n  .trim()\n  .slice(0, 6000);\nreturn [{ json: {\n  messageId: e.id || e.messageId || '',\n  from,\n  fromName,\n  to: e.to || '',\n  subject: e.subject || '（无主题）',\n  receivedAt: e.date || new Date().toISOString(),\n  content: redacted\n} }];"
+      },
+      "id": "3fe86d84-f074-4fba-9079-03937cae3468",
+      "name": "整理并脱敏邮件",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 440]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.LLM_API_URL || 'https://api.deepseek.com/chat/completions' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$vars.LLM_API_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ model: $vars.LLM_MODEL || 'deepseek-chat', temperature: 0.1, response_format: { type: 'json_object' }, messages: [ { role: 'system', content: '你是企业邮件分拣助手。只返回合法 JSON，不要 Markdown。字段：category（紧急/重要/普通/垃圾）、priority（P0/P1/P2/P3）、summary（不超过80字）、action（建议下一步，不超过50字）、reason（不超过40字）。不要编造邮件中不存在的信息。' }, { role: 'user', content: `发件人：${$json.fromName} <${$json.from}>\\n主题：${$json.subject}\\n正文：${$json.content}` } ] }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "5190f050-c99b-48f5-805a-d6b088c11af6",
+      "name": "国内模型：分类与摘要",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [740, 440],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "const email = $('整理并脱敏邮件').first().json;\nconst response = $input.first().json;\nlet content = response.choices?.[0]?.message?.content ?? response.output_text ?? response.text ?? '';\ncontent = String(content).replace(/^```json\\s*/i, '').replace(/```$/i, '').trim();\nlet ai;\ntry {\n  ai = JSON.parse(content);\n} catch (error) {\n  ai = { category: '普通', priority: 'P2', summary: content.slice(0, 80) || '模型返回无法解析', action: '请人工查看原邮件', reason: 'JSON 解析失败' };\n}\nreturn [{ json: {\n  ...email,\n  category: ai.category || '普通',\n  priority: ai.priority || 'P2',\n  summary: ai.summary || '（无摘要）',\n  action: ai.action || '请人工查看',\n  reason: ai.reason || '',\n  processedAt: new Date().toISOString()\n} }];"
+      },
+      "id": "9c1c9950-c723-492a-acdf-3b5105ac4aed",
+      "name": "解析分类结果",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1000, 440]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.FEISHU_BOT_WEBHOOK }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ msg_type: 'interactive', card: { header: { template: $json.priority === 'P0' ? 'red' : ($json.priority === 'P1' ? 'orange' : 'blue'), title: { tag: 'plain_text', content: `邮件提醒 · ${$json.category} · ${$json.priority}` } }, elements: [ { tag: 'markdown', content: `**主题：** ${$json.subject}\\n**发件人：** ${$json.fromName || $json.from}\\n**摘要：** ${$json.summary}\\n**建议：** ${$json.action}\\n**判断依据：** ${$json.reason || '—'}` }, { tag: 'hr' }, { tag: 'note', elements: [ { tag: 'plain_text', content: `处理时间：${$json.processedAt}` } ] } ] } }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "39f0a373-c666-4c44-8ce0-fece6c3e5079",
+      "name": "飞书：发送邮件卡片",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1260, 440],
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "parameters": {
+        "content": "## 企业邮箱 → 国内模型 → 飞书\n\n1. 为触发器选择你自己的 IMAP 凭证。\n2. 在项目 Variables 中配置 LLM_API_URL、LLM_API_KEY、LLM_MODEL。\n3. 配置 FEISHU_BOT_WEBHOOK。\n4. 首次运行请使用测试邮箱。\n\n工作流只向飞书发送摘要，不会自动回复或删除邮件。",
+        "height": 260,
+        "width": 360,
+        "color": 5
+      },
+      "id": "d885c295-5941-4fe8-b43d-3b6b41fc657b",
+      "name": "使用说明",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [180, 100]
+    }
+  ],
+  "connections": {
+    "企业邮箱触发器（IMAP）": {
+      "main": [[{ "node": "整理并脱敏邮件", "type": "main", "index": 0 }]]
+    },
+    "整理并脱敏邮件": {
+      "main": [[{ "node": "国内模型：分类与摘要", "type": "main", "index": 0 }]]
+    },
+    "国内模型：分类与摘要": {
+      "main": [[{ "node": "解析分类结果", "type": "main", "index": 0 }]]
+    },
+    "解析分类结果": {
+      "main": [[{ "node": "飞书：发送邮件卡片", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "timezone": "Asia/Shanghai"
+  },
+  "active": false,
+  "versionId": "86c625a6-96e6-44c2-9920-44e612c03278",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
