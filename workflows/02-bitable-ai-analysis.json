@@ -1,0 +1,217 @@
+{
+  "name": "飞书办公 02 - 多维表格 AI 分析报告",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "feishu-bitable-ai-analysis",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "68597055-c54f-4d66-aadc-7803675b5cb8",
+      "name": "接收分析请求",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [180, 460],
+      "webhookId": "41e37344-b1aa-46f3-87ec-10be64737ea5"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\nconst pageSize = Math.max(1, Math.min(Number(body.page_size || 100), 500));\nreturn [{ json: {\n  query: String(body.query || '请总结表格中的关键情况、异常点，并给出三个可执行的下一步动作。'),\n  pageSize\n} }];"
+      },
+      "id": "7394be6f-2d26-429f-a6e2-0c5784939900",
+      "name": "整理分析问题",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 460]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ app_id: String($vars.FEISHU_APP_ID || '').trim(), app_secret: String($vars.FEISHU_APP_SECRET || '').trim() }) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "f75c45b2-df80-44f8-8033-d85454a6e675",
+      "name": "飞书：获取租户 Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [660, 460],
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://open.feishu.cn/open-apis/bitable/v1/apps/' + String($vars.FEISHU_BITABLE_APP_TOKEN || '').trim() + '/tables/' + String($vars.FEISHU_BITABLE_TABLE_ID || '').trim() + '/records' }}",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "page_size",
+              "value": "={{ $('整理分析问题').first().json.pageSize }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$json.tenant_access_token}}"
+            }
+          ]
+        },
+        "options": { "timeout": 30000 }
+      },
+      "id": "b607ed2d-6876-4e07-8a05-b150583345c1",
+      "name": "飞书：读取多维表格记录",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [920, 460],
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nif (response.code && response.code !== 0) {\n  throw new Error(`飞书读取失败：${response.msg || response.code}`);\n}\nconst items = response.data?.items || [];\nconst rows = items.map((item) => ({ record_id: item.record_id, ...item.fields }));\nconst limitedJson = JSON.stringify(rows).slice(0, 80000);\nreturn [{ json: {\n  query: $('整理分析问题').first().json.query,\n  rowCount: rows.length,\n  rowsJson: limitedJson,\n  hasMore: Boolean(response.data?.has_more)\n} }];"
+      },
+      "id": "0f8fc96f-b591-4a8a-92ba-b1d8fd807043",
+      "name": "整理表格数据",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1180, 460]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.LLM_API_URL || 'https://api.deepseek.com/chat/completions' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{$vars.LLM_API_KEY}}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ model: $vars.LLM_MODEL || 'deepseek-chat', temperature: 0.1, messages: [ { role: 'system', content: '你是严谨的业务数据分析助手。只能根据提供的多维表格记录分析，不得编造。使用简洁中文 Markdown 输出，依次包含：结论、关键数字或事实、异常或风险、三个下一步动作。数据不足时明确指出。' }, { role: 'user', content: `分析问题：${$json.query}\\n记录数：${$json.rowCount}\\n是否还有未读取分页：${$json.hasMore}\\n数据：${$json.rowsJson}` } ] }) }}",
+        "options": { "timeout": 90000 }
+      },
+      "id": "255ddbf3-a0b7-491f-9b47-f53d5c95d770",
+      "name": "国内模型：分析多维表格",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1440, 460],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst report = response.choices?.[0]?.message?.content ?? response.output_text ?? response.text ?? '模型未返回报告';\nreturn [{ json: {\n  query: $('整理分析问题').first().json.query,\n  rowCount: $('整理表格数据').first().json.rowCount,\n  report: String(report),\n  generatedAt: new Date().toISOString()\n} }];"
+      },
+      "id": "428dfc04-c404-4c21-8bfb-fef1c7ce285b",
+      "name": "整理 AI 报告",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1700, 460]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.FEISHU_BOT_WEBHOOK }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ msg_type: 'interactive', card: { header: { template: 'blue', title: { tag: 'plain_text', content: '多维表格 AI 分析报告' } }, elements: [ { tag: 'markdown', content: `**问题：** ${$json.query}\\n**读取记录：** ${$json.rowCount} 条\\n\\n${$json.report}` }, { tag: 'hr' }, { tag: 'note', elements: [ { tag: 'plain_text', content: `生成时间：${$json.generatedAt}` } ] } ] } }) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "005b0363-d35b-4fe9-93a6-9f06a1724075",
+      "name": "飞书：发送分析报告",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1960, 460],
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true, query: $('整理 AI 报告').first().json.query, rowCount: $('整理 AI 报告').first().json.rowCount, report: $('整理 AI 报告').first().json.report } }}",
+        "options": {}
+      },
+      "id": "cb89a4fe-1c3e-42e4-9a2c-e5884f1a84c7",
+      "name": "返回分析结果",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [2220, 460]
+    },
+    {
+      "parameters": {
+        "content": "## 飞书多维表格 AI 分析\n\nPOST 到 Webhook：\n`{\"query\":\"本月有哪些异常？\",\"page_size\":100}`\n\n需要配置：\n- FEISHU_APP_ID\n- FEISHU_APP_SECRET\n- FEISHU_BITABLE_APP_TOKEN\n- FEISHU_BITABLE_TABLE_ID\n- FEISHU_BOT_WEBHOOK\n- LLM_API_URL / KEY / MODEL\n\n默认最多读取 500 条，模板当前不自动翻页。",
+        "height": 300,
+        "width": 380,
+        "color": 5
+      },
+      "id": "652150b1-fcb9-4aec-a0c9-da9d4aeed2ec",
+      "name": "使用说明",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [160, 80]
+    }
+  ],
+  "connections": {
+    "接收分析请求": {
+      "main": [[{ "node": "整理分析问题", "type": "main", "index": 0 }]]
+    },
+    "整理分析问题": {
+      "main": [[{ "node": "飞书：获取租户 Token", "type": "main", "index": 0 }]]
+    },
+    "飞书：获取租户 Token": {
+      "main": [[{ "node": "飞书：读取多维表格记录", "type": "main", "index": 0 }]]
+    },
+    "飞书：读取多维表格记录": {
+      "main": [[{ "node": "整理表格数据", "type": "main", "index": 0 }]]
+    },
+    "整理表格数据": {
+      "main": [[{ "node": "国内模型：分析多维表格", "type": "main", "index": 0 }]]
+    },
+    "国内模型：分析多维表格": {
+      "main": [[{ "node": "整理 AI 报告", "type": "main", "index": 0 }]]
+    },
+    "整理 AI 报告": {
+      "main": [[{ "node": "飞书：发送分析报告", "type": "main", "index": 0 }]]
+    },
+    "飞书：发送分析报告": {
+      "main": [[{ "node": "返回分析结果", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "timezone": "Asia/Shanghai"
+  },
+  "active": false,
+  "versionId": "292508c6-25f1-4509-a387-9653ee28333c",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
