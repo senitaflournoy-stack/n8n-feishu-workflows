@@ -1,0 +1,240 @@
+{
+  "name": "飞书办公 03 - PDF 图片提取到多维表格",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "feishu-document-extraction",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "ab50075e-9abf-4895-ae7b-0ca0ca9490d4",
+      "name": "接收文档地址",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [180, 480],
+      "webhookId": "96dd64e8-4c89-493d-8cc9-f7f11ec2b355"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\nif (!body.file_url) {\n  throw new Error('请求必须包含 file_url');\n}\nreturn [{ json: {\n  fileUrl: String(body.file_url),\n  sourceName: String(body.source_name || body.file_url.split('/').pop() || '未命名文档')\n} }];"
+      },
+      "id": "4d33fb53-7682-4401-bbec-3f20b5df5c02",
+      "name": "校验文档请求",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 480]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.LLM_API_URL || 'https://api.deepseek.com/chat/completions' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{$vars.LLM_API_KEY}}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ model: $vars.LLM_MODEL || 'deepseek-flash', temperature: 0, messages: [ { role: 'user', content: [ { type: 'text', text: '请完整识别图片中的所有文字。保持原有阅读顺序，尽量保留表格和段落结构。只输出识别到的文字，不要解释，不要补充不存在的内容。' }, { type: 'image_url', image_url: { url: $json.fileUrl, detail: 'original' } } ] } ] }) }}",
+        "options": { "timeout": 120000 }
+      },
+      "id": "c03b3137-04cd-475c-996e-56ae80c04d83",
+      "name": "DeepSeek视觉：提取文字",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [660, 480],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst text = response.choices?.[0]?.message?.content ?? response.text ?? response.data?.text ?? response.result?.text ?? response.data?.result?.text ?? '';\nif (!text || String(text).trim().length < 5) {\n  throw new Error('DeepSeek 未返回可用文字，请检查图片地址是否可访问');\n}\nreturn [{ json: {\n  fileUrl: $('校验文档请求').first().json.fileUrl,\n  sourceName: $('校验文档请求').first().json.sourceName,\n  ocrText: String(text).slice(0, 30000)\n} }];"
+      },
+      "id": "1e20849b-4366-4a18-8f8e-f3ee375a0a98",
+      "name": "整理 OCR 结果",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 480]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.LLM_API_URL || 'https://api.deepseek.com/chat/completions' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{$vars.LLM_API_KEY}}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ model: $vars.LLM_MODEL || 'deepseek-chat', temperature: 0.1, response_format: { type: 'json_object' }, messages: [ { role: 'system', content: '你是中文办公文档信息提取助手。只返回合法 JSON，不要 Markdown。字段：document_type、title、document_no、counterparty、amount、date、summary、risk_note。amount 保留原币种符号或单位；无法确认的字段返回空字符串；不得编造。summary 不超过120字，risk_note 不超过80字。' }, { role: 'user', content: `文件名：${$json.sourceName}\\nOCR 内容：\\n${$json.ocrText}` } ] }) }}",
+        "options": { "timeout": 90000 }
+      },
+      "id": "347fd5a8-a226-4940-b8ea-2d216767cc44",
+      "name": "国内模型：结构化文档",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1140, 480],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nlet content = response.choices?.[0]?.message?.content ?? response.output_text ?? response.text ?? '';\ncontent = String(content).replace(/^```json\\s*/i, '').replace(/```$/i, '').trim();\nlet data;\ntry {\n  data = JSON.parse(content);\n} catch (error) {\n  throw new Error(`模型结果不是合法 JSON：${content.slice(0, 300)}`);\n}\nconst source = $('整理 OCR 结果').first().json;\nreturn [{ json: {\n  fileUrl: source.fileUrl,\n  sourceName: source.sourceName,\n  documentType: data.document_type || '',\n  title: data.title || source.sourceName,\n  documentNo: data.document_no || '',\n  counterparty: data.counterparty || '',\n  amount: data.amount || '',\n  date: data.date || '',\n  summary: data.summary || '',\n  riskNote: data.risk_note || '',\n  processedAt: new Date().toISOString()\n} }];"
+      },
+      "id": "96384b3a-4658-4f00-bc99-dda50d1e2145",
+      "name": "解析文档字段",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1380, 480]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ app_id: String($vars.FEISHU_APP_ID || '').trim(), app_secret: String($vars.FEISHU_APP_SECRET || '').trim() }) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "fe6c6140-a93d-4f12-89b7-77ff13f9a2e9",
+      "name": "飞书：获取租户 Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1620, 480],
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://open.feishu.cn/open-apis/bitable/v1/apps/' + String($vars.FEISHU_BITABLE_APP_TOKEN || '').trim() + '/tables/' + String($vars.FEISHU_BITABLE_TABLE_ID || '').trim() + '/records' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{$json.tenant_access_token}}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ fields: { '文件名': $('解析文档字段').first().json.sourceName, '文件链接': $('解析文档字段').first().json.fileUrl, '文档类型': $('解析文档字段').first().json.documentType, '标题': $('解析文档字段').first().json.title, '单据编号': $('解析文档字段').first().json.documentNo, '对方单位': $('解析文档字段').first().json.counterparty, '金额': $('解析文档字段').first().json.amount, '日期': $('解析文档字段').first().json.date, '摘要': $('解析文档字段').first().json.summary, '风险提示': $('解析文档字段').first().json.riskNote, '处理时间': $('解析文档字段').first().json.processedAt } }) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "141b00d3-f059-4a43-bcc5-0785fb30ab97",
+      "name": "飞书：写入多维表格",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1860, 480],
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.FEISHU_BOT_WEBHOOK }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ msg_type: 'interactive', card: { header: { template: $('解析文档字段').first().json.riskNote ? 'orange' : 'green', title: { tag: 'plain_text', content: '文档已完成识别并入表' } }, elements: [ { tag: 'markdown', content: `**文件：** ${$('解析文档字段').first().json.sourceName}\\n**类型：** ${$('解析文档字段').first().json.documentType || '未识别'}\\n**标题：** ${$('解析文档字段').first().json.title}\\n**对方单位：** ${$('解析文档字段').first().json.counterparty || '—'}\\n**金额：** ${$('解析文档字段').first().json.amount || '—'}\\n**摘要：** ${$('解析文档字段').first().json.summary || '—'}\\n**风险提示：** ${$('解析文档字段').first().json.riskNote || '无'}` } ] } }) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "211abf67-024f-4ccb-94bc-82402f936df7",
+      "name": "飞书：发送入表通知",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2100, 480],
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true, document: $('解析文档字段').first().json } }}",
+        "options": {}
+      },
+      "id": "e61ad608-a461-4cdd-8fea-9f470e591c10",
+      "name": "返回提取结果",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [2340, 480]
+    },
+    {
+      "parameters": {
+        "content": "## 图片 → DeepSeek视觉识别 → AI → 飞书多维表格\n\nPOST：\n`{\"file_url\":\"https://.../image.png\",\"source_name\":\"发票.png\"}`\n\n识别说明：\n- 使用已有的 `LLM_API_URL`、`LLM_API_KEY`、`LLM_MODEL` 调用 DeepSeek 视觉能力。\n- `file_url` 必须是 DeepSeek 能访问的图片地址，支持 JPEG、PNG、GIF、WebP。\n- PDF 需先转换为图片再提交。\n\n请先在多维表格创建 README 中列出的中文字段。",
+        "height": 300,
+        "width": 390,
+        "color": 5
+      },
+      "id": "01a7ff8d-3be7-46c9-8083-b015ff148672",
+      "name": "使用说明",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [160, 80]
+    }
+  ],
+  "connections": {
+    "接收文档地址": {
+      "main": [[{ "node": "校验文档请求", "type": "main", "index": 0 }]]
+    },
+    "校验文档请求": {
+      "main": [[{ "node": "DeepSeek视觉：提取文字", "type": "main", "index": 0 }]]
+    },
+    "DeepSeek视觉：提取文字": {
+      "main": [[{ "node": "整理 OCR 结果", "type": "main", "index": 0 }]]
+    },
+    "整理 OCR 结果": {
+      "main": [[{ "node": "国内模型：结构化文档", "type": "main", "index": 0 }]]
+    },
+    "国内模型：结构化文档": {
+      "main": [[{ "node": "解析文档字段", "type": "main", "index": 0 }]]
+    },
+    "解析文档字段": {
+      "main": [[{ "node": "飞书：获取租户 Token", "type": "main", "index": 0 }]]
+    },
+    "飞书：获取租户 Token": {
+      "main": [[{ "node": "飞书：写入多维表格", "type": "main", "index": 0 }]]
+    },
+    "飞书：写入多维表格": {
+      "main": [[{ "node": "飞书：发送入表通知", "type": "main", "index": 0 }]]
+    },
+    "飞书：发送入表通知": {
+      "main": [[{ "node": "返回提取结果", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "timezone": "Asia/Shanghai"
+  },
+  "active": false,
+  "versionId": "5378ee1b-8758-4643-8639-72fcb05a8e61",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
